@@ -5,18 +5,15 @@ Telegram video downloader bot.
 Этот скрипт реализует Telegram‑бота, который принимает ссылки на видео из популярных сервисов
 и возвращает скачанный файл пользователю или ссылку на скачивание, если файл слишком большой.
 
-Бот запускается как Flask‑веб‑сервис и использует веб‑хуки, поэтому подходит для хостинга
-на бесплатных платформах, где запрещены фоновые workers.
+Бот запускается через встроенный веб-сервер python-telegram-bot (webhook), что подходит
+для хостинга на Render.
 """
 
 import os
 import logging
 import asyncio
-import tempfile
 import uuid
 from pathlib import Path
-
-from flask import Flask, request, abort, jsonify
 
 from telegram import (
     Update,
@@ -60,7 +57,7 @@ DOWNLOAD_DIR = Path(__file__).parent / "downloads"
 DOWNLOAD_DIR.mkdir(exist_ok=True)
 
 
-def is_subscribed(user_id: int, channel: str, application: Application) -> bool:
+async def is_subscribed(user_id: int, channel: str, application: Application) -> bool:
     """Check whether a user is subscribed to a channel.
 
     Returns True if subscribed or no channel configured.
@@ -69,8 +66,7 @@ def is_subscribed(user_id: int, channel: str, application: Application) -> bool:
         # No channel restriction
         return True
     try:
-        member = application.bot.get_chat_member(chat_id=channel, user_id=user_id)
-        # If the user is banned or left, status will be 'left' or 'kicked'
+        member = await application.bot.get_chat_member(chat_id=channel, user_id=user_id)
         return member.status in ("creator", "administrator", "member")
     except TelegramError as e:
         logger.warning("Failed to check subscription: %s", e)
@@ -166,19 +162,16 @@ def upload_to_transfersh(file_path: Path) -> str:
     raise RuntimeError(f"Failed to upload file: HTTP {response.status_code}")
 
 
-# Flask app and Telegram application
-flask_app = Flask(__name__)
+# Telegram application
 telegram_app = Application.builder().token(TELEGRAM_TOKEN).build()
 
 
-@telegram_app.add_error_handler()
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Global error handler for Telegram application."""
     logger.exception("An error occurred: %s", context.error)
     await send_error_to_admin(context, f"⚠️ Произошла ошибка: {context.error}")
 
 
-@telegram_app.command_handler("start")
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /start command."""
     keyboard = [
@@ -195,7 +188,6 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     )
 
 
-@telegram_app.callback_query_handler()
 async def on_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle button presses from inline keyboard."""
     query = update.callback_query
@@ -206,7 +198,7 @@ async def on_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     if data == "help":
         await query.message.reply_text(
             "Отправьте мне ссылку на видео, и я постараюсь его скачать. "
-            "Поддерживаются Instagram, TikTok, YouTube Shorts и VK. Если файл больше 50 МБ, "
+            "Поддерживаются Instagram, TikTok, YouTube Shorts и VK. Если файл больше 50 МБ, "
             "я пришлю ссылку для скачивания."
         )
     elif data == "download":
@@ -215,14 +207,13 @@ async def on_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         )
 
 
-@telegram_app.message_handler(filters=filters.TEXT & ~filters.COMMAND)
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle incoming messages with potential URLs."""
     if not update.message:
         return
     user_id = update.message.from_user.id
     # Enforce subscription if required
-    if not is_subscribed(user_id, REQUIRED_CHANNEL, telegram_app):
+    if not await is_subscribed(user_id, REQUIRED_CHANNEL, telegram_app):
         channel_link = REQUIRED_CHANNEL if REQUIRED_CHANNEL.startswith('@') else f"https://t.me/{REQUIRED_CHANNEL.lstrip('-')}"
         await update.message.reply_text(
             f"Чтобы пользоваться ботом, подпишитесь на канал {channel_link} и попробуйте снова."
@@ -253,7 +244,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         max_size = 50 * 1024 * 1024  # 50 MB
         if file_size <= max_size:
             # Send directly
-            await update.message.reply_video(video=open(file_path, 'rb'))
+            with open(file_path, 'rb') as f:
+                await update.message.reply_video(video=f)
         else:
             # Upload to transfer.sh
             try:
@@ -274,55 +266,27 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             pass
 
 
-@flask_app.route('/')
-def index() -> str:
-    return 'OK'
-
-
-@flask_app.route('/webhook', methods=['POST'])
-def webhook() -> tuple[str, int]:
-    """Entry point for Telegram webhooks."""
-    if request.method == 'POST':
-        try:
-            update_json = request.get_json(force=True)
-        except Exception:
-            return 'Invalid request', 400
-        update = Update.de_json(update_json, telegram_app.bot)
-        # Process update asynchronously
-        telegram_app.create_task(telegram_app.process_update(update))
-        return 'OK', 200
-    else:
-        abort(405)
-
-
-async def set_webhook(app_url: str) -> None:
-    """Register the webhook with Telegram if BASE_URL is provided."""
-    webhook_url = f"{app_url.rstrip('/')}/webhook"
-    async with telegram_app.bot.session.post(
-        url=f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/setWebhook",
-        data={'url': webhook_url},
-    ) as resp:
-        result = await resp.json()
-        if not result.get('ok'):
-            logger.error("Failed to set webhook: %s", result)
-        else:
-            logger.info("Webhook set to %s", webhook_url)
+# Регистрация хендлеров (обязательно после определения функций выше)
+telegram_app.add_error_handler(on_error)
+telegram_app.add_handler(CommandHandler("start", start_command))
+telegram_app.add_handler(CallbackQueryHandler(on_callback_query))
+telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
 
 def run() -> None:
-    """Start Flask app and optionally set webhook."""
+    """Start the bot using PTB's built-in webhook server."""
+    port = int(os.environ.get("PORT", 8080))
     if BASE_URL:
-        # Schedule webhook registration on startup
-        telegram_app.create_task(set_webhook(BASE_URL))
-    # Start Flask app within event loop
-    telegram_app.run_webhook(
-        listen="0.0.0.0",
-        port=int(os.environ.get("PORT", 8080)),
-        webhook_url=None,  # We'll use Flask to receive updates
-        
-        # Use provided Flask app instead of built-in web server
-        web_app=flask_app,
-    )
+        webhook_url = f"{BASE_URL.rstrip('/')}/webhook"
+        telegram_app.run_webhook(
+            listen="0.0.0.0",
+            port=port,
+            url_path="/webhook",
+            webhook_url=webhook_url,
+        )
+    else:
+        # Fallback: polling (для локальной отладки; на Render как web service не подходит)
+        telegram_app.run_polling()
 
 
 if __name__ == '__main__':
