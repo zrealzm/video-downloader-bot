@@ -45,7 +45,8 @@ logger = logging.getLogger(__name__)
 # Environment variables
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 ADMIN_ID = os.getenv("ADMIN_ID")  # Telegram ID of admin for error notifications
-REQUIRED_CHANNEL = os.getenv("REQUIRED_CHANNEL")  # Channel username or ID
+REQUIRED_CHANNEL = os.getenv("REQUIRED_CHANNEL")  # Numeric chat_id of the private channel, e.g. -1001234567890
+REQUIRED_CHANNEL_LINK = os.getenv("REQUIRED_CHANNEL_LINK")  # Invite link shown to users, e.g. https://t.me/+xxxxxxxxxxxx
 BASE_URL = os.getenv("BASE_URL")  # Public URL of this service for webhook
 
 if not TELEGRAM_TOKEN:
@@ -128,10 +129,21 @@ def download_with_ytdlp(url: str, platform: str) -> Path:
         'merge_output_format': 'mp4',
     }
 
-    # Add cookies for Instagram if available
+    # Add cookies for Instagram if available and the file looks like a valid
+    # Netscape-format cookies file (yt-dlp/http.cookiejar will crash otherwise)
     cookies_path = Path(__file__).parent / 'cookies.txt'
     if platform == 'instagram' and cookies_path.exists():
-        ydl_opts['cookiefile'] = str(cookies_path)
+        try:
+            first_line = cookies_path.read_text(encoding='utf-8', errors='ignore').splitlines()[0]
+        except (IndexError, OSError):
+            first_line = ''
+        if first_line.startswith('# Netscape HTTP Cookie File') or first_line.startswith('# HTTP Cookie File'):
+            ydl_opts['cookiefile'] = str(cookies_path)
+        else:
+            logger.warning(
+                "cookies.txt exists but is not in Netscape format, ignoring it: %s",
+                cookies_path,
+            )
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         logger.info("Starting download: %s", url)
@@ -214,7 +226,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     user_id = update.message.from_user.id
     # Enforce subscription if required
     if not await is_subscribed(user_id, REQUIRED_CHANNEL, telegram_app):
-        channel_link = REQUIRED_CHANNEL if REQUIRED_CHANNEL.startswith('@') else f"https://t.me/{REQUIRED_CHANNEL.lstrip('-')}"
+        channel_link = REQUIRED_CHANNEL_LINK or REQUIRED_CHANNEL
         await update.message.reply_text(
             f"Чтобы пользоваться ботом, подпишитесь на канал {channel_link} и попробуйте снова."
         )
