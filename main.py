@@ -171,7 +171,7 @@ flask_app = Flask(__name__)
 telegram_app = Application.builder().token(TELEGRAM_TOKEN).build()
 
 
-@telegram_app.error_handler()
+@telegram_app.add_error_handler()
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Global error handler for Telegram application."""
     logger.exception("An error occurred: %s", context.error)
