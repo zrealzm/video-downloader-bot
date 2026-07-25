@@ -12,8 +12,11 @@ Telegram video downloader bot.
 import os
 import logging
 import asyncio
+import html as html_lib
+import re
 import shutil
 import uuid
+from http.cookiejar import MozillaCookieJar
 from pathlib import Path
 
 from telegram import (
@@ -115,6 +118,60 @@ IMAGE_EXTS = {'.jpg', '.jpeg', '.png', '.webp'}
 VIDEO_EXTS = {'.mp4', '.mov', '.mkv', '.webm'}
 
 
+def _requests_session_with_cookies() -> requests.Session:
+    """Build a requests session, reusing cookies.txt if it's valid, so the
+    fallback scraper sees the same logged-in session yt-dlp would use."""
+    session = requests.Session()
+    session.headers.update({
+        'User-Agent': (
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+            '(KHTML, like Gecko) Chrome/124.0 Safari/537.36'
+        ),
+    })
+    cookies_path = Path(__file__).parent / 'cookies.txt'
+    if cookies_path.exists():
+        try:
+            jar = MozillaCookieJar(str(cookies_path))
+            jar.load(ignore_discard=True, ignore_expires=True)
+            session.cookies.update(jar)
+        except Exception as exc:
+            logger.warning("Failed to load cookies.txt for photo fallback: %s", exc)
+    return session
+
+
+def download_instagram_photo_fallback(url: str) -> tuple[list[Path], str | None]:
+    """Fallback for single Instagram photo posts.
+
+    yt-dlp's Instagram extractor is primarily built for video content and can
+    raise 'No video formats found!' for photo-only posts. This scrapes the
+    Open Graph image/description tags directly from the post page instead.
+    """
+    session = _requests_session_with_cookies()
+    resp = session.get(url, timeout=20)
+    resp.raise_for_status()
+    page = resp.text
+
+    img_match = re.search(r'<meta property="og:image" content="([^"]+)"', page)
+    if not img_match:
+        raise RuntimeError(
+            "og:image not found on the post page (it may be private or require login)"
+        )
+    image_url = html_lib.unescape(img_match.group(1))
+
+    desc_match = re.search(r'<meta property="og:description" content="([^"]+)"', page)
+    caption = html_lib.unescape(desc_match.group(1)) if desc_match else None
+
+    uid = uuid.uuid4().hex
+    target_dir = DOWNLOAD_DIR / uid
+    target_dir.mkdir(parents=True, exist_ok=True)
+    img_resp = session.get(image_url, timeout=30)
+    img_resp.raise_for_status()
+    file_path = target_dir / f"{uid}.jpg"
+    file_path.write_bytes(img_resp.content)
+    logger.info("Photo fallback OK: caption_len=%s", len(caption) if caption else 0)
+    return [file_path], caption
+
+
 def download_with_ytdlp(url: str, platform: str) -> tuple[list[Path], str | None]:
     """Download a post using yt-dlp and return all resulting files along with
     the post/reel caption (if available).
@@ -178,9 +235,19 @@ def download_with_ytdlp(url: str, platform: str) -> tuple[list[Path], str | None
         files = sorted(p for p in target_dir.iterdir() if p.is_file())
         if not files:
             raise RuntimeError("yt-dlp finished without producing any files")
+        logger.info(
+            "Download OK: %d file(s), cookies_used=%s, caption_len=%s, caption_preview=%r",
+            len(files),
+            bool(ydl_opts.get('cookiefile')),
+            len(caption) if caption else 0,
+            (caption or '')[:200],
+        )
         return files, caption
-    except Exception:
+    except Exception as exc:
         shutil.rmtree(target_dir, ignore_errors=True)
+        if platform == 'instagram' and 'No video formats found' in str(exc):
+            logger.info("yt-dlp found no video formats, falling back to photo scrape: %s", url)
+            return download_instagram_photo_fallback(url)
         raise
 
 
