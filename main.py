@@ -12,6 +12,7 @@ Telegram video downloader bot.
 import os
 import logging
 import asyncio
+import shutil
 import uuid
 from pathlib import Path
 
@@ -19,6 +20,8 @@ from telegram import (
     Update,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    InputMediaPhoto,
+    InputMediaVideo,
 )
 from telegram.ext import (
     Application,
@@ -108,16 +111,25 @@ def get_platform(url: str) -> str | None:
     return None
 
 
-def download_with_ytdlp(url: str, platform: str) -> Path:
-    """Download a video using yt-dlp and return the path to the downloaded file.
+IMAGE_EXTS = {'.jpg', '.jpeg', '.png', '.webp'}
+VIDEO_EXTS = {'.mp4', '.mov', '.mkv', '.webm'}
 
-    This function runs synchronously and may block. It returns the path of the downloaded file
-    in DOWNLOAD_DIR.
+
+def download_with_ytdlp(url: str, platform: str) -> tuple[list[Path], str | None]:
+    """Download a post using yt-dlp and return all resulting files along with
+    the post/reel caption (if available).
+
+    Handles both single video/photo posts and carousels (multiple photos/videos
+    in one post) — yt-dlp downloads every item in a carousel by default, so we
+    collect all files that end up in a dedicated per-request directory rather
+    than assuming there is exactly one output file.
     """
-    # Create a unique filename prefix to avoid collisions
     uid = uuid.uuid4().hex
-    # Output template: store in downloads directory with uid
-    outtmpl = str(DOWNLOAD_DIR / f"{uid}.%(ext)s")
+    target_dir = DOWNLOAD_DIR / uid
+    target_dir.mkdir(parents=True, exist_ok=True)
+    # autonumber ensures unique, ordered filenames for every item, whether the
+    # post is a single video or a multi-item carousel.
+    outtmpl = str(target_dir / '%(autonumber)03d_%(id)s.%(ext)s')
 
     ydl_opts: dict[str, object] = {
         'outtmpl': outtmpl,
@@ -145,21 +157,35 @@ def download_with_ytdlp(url: str, platform: str) -> Path:
                 cookies_path,
             )
 
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        logger.info("Starting download: %s", url)
-        info_dict = ydl.extract_info(url, download=True)
-        # Determine file extension and path
-        if 'requested_downloads' in info_dict:
-            # When using merge_output_format the final file name is in requested_downloads
-            download_info = info_dict['requested_downloads'][0]
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            logger.info("Starting download: %s", url)
+            info_dict = ydl.extract_info(url, download=True)
+
+        entries = info_dict.get('entries')
+        if entries:
+            # Carousel: the caption usually lives on the playlist-level
+            # 'description', but fall back to the first entry's description.
+            caption = info_dict.get('description') or next(
+                (e.get('description') for e in entries if e and e.get('description')),
+                None,
+            ) or info_dict.get('title')
         else:
-            download_info = info_dict
-        filepath = download_info.get('filepath') or download_info.get('filename') or outtmpl
-        return Path(filepath)
+            caption = info_dict.get('description') or info_dict.get('title')
+
+        # Collect every file yt-dlp produced for this request (one file for a
+        # single video/photo, several for a carousel).
+        files = sorted(p for p in target_dir.iterdir() if p.is_file())
+        if not files:
+            raise RuntimeError("yt-dlp finished without producing any files")
+        return files, caption
+    except Exception:
+        shutil.rmtree(target_dir, ignore_errors=True)
+        raise
 
 
-async def download_video(url: str, platform: str) -> Path:
-    """Download video asynchronously using a thread executor."""
+async def download_video(url: str, platform: str) -> tuple[list[Path], str | None]:
+    """Download post asynchronously using a thread executor."""
     loop = asyncio.get_event_loop()
     return await loop.run_in_executor(None, download_with_ytdlp, url, platform)
 
@@ -243,39 +269,80 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     # Acknowledge reception
     await update.message.reply_text("🔄 Загружаю ваше видео, подождите немного...")
     try:
-        # Download video asynchronously
-        file_path = await download_video(url, platform)
+        # Download post asynchronously (may return several files for a carousel)
+        file_paths, caption = await download_video(url, platform)
     except Exception as exc:
         logger.exception("Download failed: %s", exc)
         await update.message.reply_text("Не удалось скачать видео. Возможно, ссылка неправильная или доступ ограничен.")
         await send_error_to_admin(context, f"Ошибка загрузки для пользователя {user_id}: {exc}")
         return
-    # Send or upload depending on size
-    try:
-        file_size = file_path.stat().st_size
-        max_size = 50 * 1024 * 1024  # 50 MB
-        if file_size <= max_size:
-            # Send directly
-            with open(file_path, 'rb') as f:
-                await update.message.reply_video(video=f)
+
+    max_size = 50 * 1024 * 1024  # 50 MB
+    TELEGRAM_CAPTION_LIMIT = 1024
+    video_caption = None
+    extra_text = None
+    if caption:
+        if len(caption) <= TELEGRAM_CAPTION_LIMIT:
+            video_caption = caption
         else:
-            # Upload to transfer.sh
+            video_caption = caption[:TELEGRAM_CAPTION_LIMIT]
+            extra_text = caption[TELEGRAM_CAPTION_LIMIT:]
+
+    try:
+        # Split into files small enough to send directly vs. ones that need
+        # to be uploaded externally (Telegram's ~50 MB bot upload limit).
+        sendable = [p for p in file_paths if p.stat().st_size <= max_size]
+        oversized = [p for p in file_paths if p.stat().st_size > max_size]
+
+        if len(sendable) == 1 and not oversized:
+            # Single file: send as video or photo depending on extension
+            p = sendable[0]
+            with open(p, 'rb') as f:
+                if p.suffix.lower() in IMAGE_EXTS:
+                    await update.message.reply_photo(photo=f, caption=video_caption)
+                else:
+                    await update.message.reply_video(video=f, caption=video_caption)
+            if extra_text:
+                await update.message.reply_text(extra_text)
+        elif sendable:
+            # Carousel: send as a media group, Telegram allows max 10 items per group
+            open_files = []
             try:
-                link = upload_to_transfersh(file_path)
+                for chunk_start in range(0, len(sendable), 10):
+                    chunk = sendable[chunk_start:chunk_start + 10]
+                    media = []
+                    for i, p in enumerate(chunk):
+                        f = open(p, 'rb')
+                        open_files.append(f)
+                        item_caption = video_caption if (chunk_start == 0 and i == 0) else None
+                        if p.suffix.lower() in IMAGE_EXTS:
+                            media.append(InputMediaPhoto(media=f, caption=item_caption))
+                        else:
+                            media.append(InputMediaVideo(media=f, caption=item_caption))
+                    await update.message.reply_media_group(media=media)
+            finally:
+                for f in open_files:
+                    f.close()
+            if extra_text:
+                await update.message.reply_text(extra_text)
+        else:
+            await update.message.reply_text("Не удалось скачать видео. Возможно, ссылка неправильная или доступ ограничен.")
+
+        # Anything too large to send directly gets uploaded externally
+        for p in oversized:
+            try:
+                link = upload_to_transfersh(p)
                 await update.message.reply_text(
-                    f"Файл слишком большой для отправки в Telegram. Вот ссылка для скачивания: {link}"
+                    f"Файл {p.name} слишком большой для отправки в Telegram. Вот ссылка для скачивания: {link}"
                 )
             except Exception as exc:
                 logger.exception("Upload failed: %s", exc)
-                await update.message.reply_text("Не удалось загрузить видео на внешний сервис.")
-                await send_error_to_admin(context, f"Ошибка загрузки файла {file_path.name}: {exc}")
-                return
+                await update.message.reply_text(f"Не удалось загрузить файл {p.name} на внешний сервис.")
+                await send_error_to_admin(context, f"Ошибка загрузки файла {p.name}: {exc}")
     finally:
-        # Clean up downloaded file
-        try:
-            file_path.unlink(missing_ok=True)
-        except Exception:
-            pass
+        # Clean up the whole per-request download directory
+        if file_paths:
+            shutil.rmtree(file_paths[0].parent, ignore_errors=True)
 
 
 # Регистрация хендлеров (обязательно после определения функций выше)
