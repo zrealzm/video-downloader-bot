@@ -196,6 +196,12 @@ def download_with_ytdlp(url: str, platform: str) -> tuple[list[Path], str | None
         'format': 'bestvideo+bestaudio/best',
         # Some sites require this to embed video and audio
         'merge_output_format': 'mp4',
+        # If one item in a carousel can't be extracted (e.g. a photo slide
+        # yt-dlp's Instagram extractor fails on), skip just that item instead
+        # of aborting the whole post's download.
+        'ignoreerrors': True,
+        # Only ever download the first item of a carousel/playlist.
+        'playlist_items': '1',
     }
 
     # Add cookies for Instagram if available and the file looks like a valid
@@ -219,12 +225,19 @@ def download_with_ytdlp(url: str, platform: str) -> tuple[list[Path], str | None
             logger.info("Starting download: %s", url)
             info_dict = ydl.extract_info(url, download=True)
 
+        if info_dict is None:
+            # With ignoreerrors=True, a totally unextractable single post
+            # (e.g. a lone photo yt-dlp's Instagram extractor can't handle)
+            # comes back as None instead of raising.
+            raise RuntimeError("yt-dlp returned no info for this URL")
+
         entries = info_dict.get('entries')
         if entries:
+            entries = [e for e in entries if e]  # drop skipped/failed entries
             # Carousel: the caption usually lives on the playlist-level
             # 'description', but fall back to the first entry's description.
             caption = info_dict.get('description') or next(
-                (e.get('description') for e in entries if e and e.get('description')),
+                (e.get('description') for e in entries if e.get('description')),
                 None,
             ) or info_dict.get('title')
         else:
@@ -245,9 +258,12 @@ def download_with_ytdlp(url: str, platform: str) -> tuple[list[Path], str | None
         return files, caption
     except Exception as exc:
         shutil.rmtree(target_dir, ignore_errors=True)
-        if platform == 'instagram' and 'No video formats found' in str(exc):
-            logger.info("yt-dlp found no video formats, falling back to photo scrape: %s", url)
-            return download_instagram_photo_fallback(url)
+        if platform == 'instagram':
+            logger.info("yt-dlp failed (%s), trying photo-page fallback for: %s", exc, url)
+            try:
+                return download_instagram_photo_fallback(url)
+            except Exception as fallback_exc:
+                logger.warning("Photo fallback also failed: %s", fallback_exc)
         raise
 
 
@@ -313,8 +329,13 @@ async def on_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle incoming messages with potential URLs."""
-    if not update.message:
+    """Handle incoming messages, but only react to ones containing a link."""
+    if not update.message or not update.message.text:
+        return
+    text = update.message.text
+    url = extract_url(text)
+    if not url:
+        # Not a link — let people chat in the group without the bot reacting.
         return
     user_id = update.message.from_user.id
     # Enforce subscription if required
@@ -323,11 +344,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await update.message.reply_text(
             f"Чтобы пользоваться ботом, подпишитесь на канал {channel_link} и попробуйте снова."
         )
-        return
-    text = update.message.text
-    url = extract_url(text)
-    if not url:
-        await update.message.reply_text("Я не вижу ссылки в вашем сообщении. Пожалуйста, отправьте корректную ссылку.")
         return
     platform = get_platform(url)
     if not platform:
