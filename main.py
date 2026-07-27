@@ -129,13 +129,18 @@ def _requests_session_with_cookies() -> requests.Session:
         ),
     })
     cookies_path = Path(__file__).parent / 'cookies.txt'
+    cookie_count = 0
     if cookies_path.exists():
         try:
             jar = MozillaCookieJar(str(cookies_path))
             jar.load(ignore_discard=True, ignore_expires=True)
             session.cookies.update(jar)
+            cookie_count = len(jar)
         except Exception as exc:
             logger.warning("Failed to load cookies.txt for photo fallback: %s", exc)
+    else:
+        logger.warning("cookies.txt not found at %s", cookies_path)
+    logger.info("Photo fallback session: cookies_loaded=%d", cookie_count)
     return session
 
 
@@ -147,18 +152,40 @@ def download_instagram_photo_fallback(url: str) -> tuple[list[Path], str | None]
     Open Graph image/description tags directly from the post page instead.
     """
     session = _requests_session_with_cookies()
-    resp = session.get(url, timeout=20)
+    resp = session.get(
+        url,
+        timeout=20,
+        headers={
+            'Accept-Language': 'en-US,en;q=0.9,ru;q=0.8',
+            'Referer': 'https://www.instagram.com/',
+        },
+    )
     resp.raise_for_status()
     page = resp.text
+    logger.info(
+        "Photo fallback page fetched: status=%s final_url=%s len=%d",
+        resp.status_code,
+        resp.url,
+        len(page),
+    )
 
-    img_match = re.search(r'<meta property="og:image" content="([^"]+)"', page)
+    img_match = (
+        re.search(r'<meta property="og:image" content="([^"]+)"', page)
+        or re.search(r'<meta content="([^"]+)" property="og:image"', page)
+        or re.search(r'"display_url"\s*:\s*"([^"]+)"', page)
+    )
     if not img_match:
+        logger.warning("Photo fallback page snippet: %r", page[:500])
         raise RuntimeError(
-            "og:image not found on the post page (it may be private or require login)"
+            "og:image not found on the post page (it may be private, require login, "
+            "or Instagram served a login-wall page to this server's IP)"
         )
-    image_url = html_lib.unescape(img_match.group(1))
+    image_url = html_lib.unescape(img_match.group(1)).replace('\\u0026', '&').replace('\\/', '/')
 
-    desc_match = re.search(r'<meta property="og:description" content="([^"]+)"', page)
+    desc_match = (
+        re.search(r'<meta property="og:description" content="([^"]+)"', page)
+        or re.search(r'<meta content="([^"]+)" property="og:description"', page)
+    )
     caption = html_lib.unescape(desc_match.group(1)) if desc_match else None
 
     uid = uuid.uuid4().hex
