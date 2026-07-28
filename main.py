@@ -396,14 +396,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if not platform:
         await update.message.reply_text("Извините, я пока не умею скачивать с этого ресурса. Поддерживаются Instagram, TikTok, YouTube Shorts и VK.")
         return
-    # Acknowledge reception
-    await update.message.reply_text("🔄 Загружаю ваше видео, подождите немного...")
     try:
         # Download post asynchronously (may return several files for a carousel)
         file_paths, caption = await download_video(url, platform)
     except Exception as exc:
         logger.exception("Download failed: %s", exc)
-        await update.message.reply_text("Не удалось скачать видео. Возможно, ссылка неправильная или доступ ограничен.")
+        if platform == 'instagram' and 'No video formats found' in str(exc):
+            await update.message.reply_text(
+                "Похоже, это фото-пост Instagram — сейчас такие посты (без видео) "
+                "скачать не получается из-за ограничений на стороне Instagram/yt-dlp. "
+                "Видео и рилсы работают нормально."
+            )
+        else:
+            await update.message.reply_text("Не удалось скачать видео. Возможно, ссылка неправильная или доступ ограничен.")
         await send_error_to_admin(context, f"Ошибка загрузки для пользователя {user_id}: {exc}")
         return
 
