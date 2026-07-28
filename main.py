@@ -152,14 +152,15 @@ def download_instagram_photo_fallback(url: str) -> tuple[list[Path], str | None]
     Open Graph image/description tags directly from the post page instead.
     """
     session = _requests_session_with_cookies()
-    resp = session.get(
-        url,
-        timeout=20,
-        headers={
-            'Accept-Language': 'en-US,en;q=0.9,ru;q=0.8',
-            'Referer': 'https://www.instagram.com/',
-        },
-    )
+    # Instagram serves a JS app shell (no Open Graph meta tags in the initial
+    # HTML) to regular browser User-Agents, but still server-renders full
+    # og: tags for social-media crawlers (so link previews work in
+    # Messenger/Twitter/Discord etc.) — spoof that instead of a browser UA.
+    crawler_headers = {
+        'User-Agent': 'facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)',
+        'Accept-Language': 'en-US,en;q=0.9,ru;q=0.8',
+    }
+    resp = session.get(url, timeout=20, headers=crawler_headers)
     resp.raise_for_status()
     page = resp.text
     logger.info(
@@ -174,6 +175,25 @@ def download_instagram_photo_fallback(url: str) -> tuple[list[Path], str | None]
         or re.search(r'<meta content="([^"]+)" property="og:image"', page)
         or re.search(r'"display_url"\s*:\s*"([^"]+)"', page)
     )
+    if not img_match:
+        # Retry once with a regular browser UA (+ cookies) in case the
+        # crawler UA got a stripped-down or blocked response instead.
+        logger.warning("Crawler-UA fetch had no og:image, snippet: %r", page[:500])
+        resp = session.get(
+            url,
+            timeout=20,
+            headers={
+                'Accept-Language': 'en-US,en;q=0.9,ru;q=0.8',
+                'Referer': 'https://www.instagram.com/',
+            },
+        )
+        resp.raise_for_status()
+        page = resp.text
+        img_match = (
+            re.search(r'<meta property="og:image" content="([^"]+)"', page)
+            or re.search(r'<meta content="([^"]+)" property="og:image"', page)
+            or re.search(r'"display_url"\s*:\s*"([^"]+)"', page)
+        )
     if not img_match:
         logger.warning("Photo fallback page snippet: %r", page[:500])
         raise RuntimeError(
