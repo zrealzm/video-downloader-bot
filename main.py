@@ -239,8 +239,19 @@ def download_with_ytdlp(url: str, platform: str) -> tuple[list[Path], str | None
         'outtmpl': outtmpl,
         'quiet': True,
         'no_warnings': True,
-        # Format selection: best video+audio
-        'format': 'bestvideo+bestaudio/best',
+        # Prefer an already-muxed single file (video+audio together) if one
+        # is available — Instagram/TikTok/etc. usually offer this directly.
+        # Only fall back to merging separate video+audio streams via ffmpeg
+        # when no combined format exists; that merge step was producing
+        # files with a broken/frozen video track (audio-only playback) in
+        # Telegram for some posts.
+        'format': 'best/bestvideo+bestaudio',
+        # Ensure the video's metadata (moov atom) is at the start of the
+        # file so Telegram (and other players) can start playback and show
+        # a proper video preview instead of treating it as a static file.
+        'postprocessor_args': {
+            'ffmpeg': ['-movflags', '+faststart'],
+        },
         # Some sites require this to embed video and audio
         'merge_output_format': 'mp4',
         # If one item in a carousel can't be extracted (e.g. a photo slide
@@ -436,7 +447,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 if p.suffix.lower() in IMAGE_EXTS:
                     await update.message.reply_photo(photo=f, caption=video_caption)
                 else:
-                    await update.message.reply_video(video=f, caption=video_caption)
+                    await update.message.reply_video(video=f, caption=video_caption, supports_streaming=True)
             if extra_text:
                 await update.message.reply_text(extra_text)
         elif sendable:
@@ -453,7 +464,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                         if p.suffix.lower() in IMAGE_EXTS:
                             media.append(InputMediaPhoto(media=f, caption=item_caption))
                         else:
-                            media.append(InputMediaVideo(media=f, caption=item_caption))
+                            media.append(InputMediaVideo(media=f, caption=item_caption, supports_streaming=True))
                     await update.message.reply_media_group(media=media)
             finally:
                 for f in open_files:
