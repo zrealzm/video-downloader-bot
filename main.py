@@ -13,8 +13,10 @@ import os
 import logging
 import asyncio
 import html as html_lib
+import json
 import re
 import shutil
+import subprocess
 import uuid
 from http.cookiejar import MozillaCookieJar
 from pathlib import Path
@@ -219,6 +221,41 @@ def download_instagram_photo_fallback(url: str) -> tuple[list[Path], str | None]
     return [file_path], caption
 
 
+def _log_ffprobe_summary(file_path: Path) -> None:
+    """Log codec/duration/frame-count info for each stream in a downloaded
+    video, to diagnose cases where playback shows a static image with only
+    audio playing (usually a video-stream/frame-count problem)."""
+    try:
+        result = subprocess.run(
+            [
+                'ffprobe', '-v', 'error',
+                '-show_entries', 'stream=index,codec_type,codec_name,width,height,'
+                                  'avg_frame_rate,nb_frames,duration',
+                '-of', 'json',
+                str(file_path),
+            ],
+            capture_output=True, text=True, timeout=20,
+        )
+        info = json.loads(result.stdout or '{}')
+        streams = info.get('streams', [])
+        summary = [
+            {
+                'type': s.get('codec_type'),
+                'codec': s.get('codec_name'),
+                'size': f"{s.get('width')}x{s.get('height')}" if s.get('width') else None,
+                'fps': s.get('avg_frame_rate'),
+                'frames': s.get('nb_frames'),
+                'duration': s.get('duration'),
+            }
+            for s in streams
+        ]
+        logger.info("ffprobe %s: %s", file_path.name, summary)
+        if result.stderr:
+            logger.warning("ffprobe stderr for %s: %s", file_path.name, result.stderr.strip())
+    except Exception as exc:
+        logger.warning("ffprobe diagnostic failed for %s: %s", file_path.name, exc)
+
+
 def download_with_ytdlp(url: str, platform: str) -> tuple[list[Path], str | None]:
     """Download a post using yt-dlp and return all resulting files along with
     the post/reel caption (if available).
@@ -313,6 +350,9 @@ def download_with_ytdlp(url: str, platform: str) -> tuple[list[Path], str | None
             len(caption) if caption else 0,
             (caption or '')[:200],
         )
+        for p in files:
+            if p.suffix.lower() in VIDEO_EXTS:
+                _log_ffprobe_summary(p)
         return files, caption
     except Exception as exc:
         shutil.rmtree(target_dir, ignore_errors=True)
@@ -325,10 +365,27 @@ def download_with_ytdlp(url: str, platform: str) -> tuple[list[Path], str | None
         raise
 
 
+# Limit how many downloads run at the same time. Render's free tier has
+# very limited CPU/RAM, and running several yt-dlp/ffmpeg jobs at once was
+# likely causing the timeouts under bursts of requests — extra requests now
+# simply queue instead of competing for the same scarce resources.
+MAX_CONCURRENT_DOWNLOADS = 2
+_download_semaphore: asyncio.Semaphore | None = None
+
+
+def _get_download_semaphore() -> asyncio.Semaphore:
+    global _download_semaphore
+    if _download_semaphore is None:
+        _download_semaphore = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
+    return _download_semaphore
+
+
 async def download_video(url: str, platform: str) -> tuple[list[Path], str | None]:
-    """Download post asynchronously using a thread executor."""
-    loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(None, download_with_ytdlp, url, platform)
+    """Download post asynchronously using a thread executor, capped to
+    MAX_CONCURRENT_DOWNLOADS concurrent jobs."""
+    async with _get_download_semaphore():
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(None, download_with_ytdlp, url, platform)
 
 
 def upload_to_transfersh(file_path: Path) -> str:
