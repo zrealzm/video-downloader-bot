@@ -40,6 +40,7 @@ from telegram.error import TelegramError
 
 import yt_dlp
 import requests
+from aiohttp import web
 
 
 # Configure logging
@@ -221,10 +222,12 @@ def download_instagram_photo_fallback(url: str) -> tuple[list[Path], str | None]
     return [file_path], caption
 
 
-def _log_ffprobe_summary(file_path: Path) -> None:
-    """Log codec/duration/frame-count info for each stream in a downloaded
-    video, to diagnose cases where playback shows a static image with only
-    audio playing (usually a video-stream/frame-count problem)."""
+def get_video_metadata(file_path: Path) -> dict:
+    """Probe a video file and return {'width', 'height', 'duration'} (best
+    effort — empty dict if ffprobe fails). Also logs a full stream summary,
+    to diagnose cases where playback shows a static image with only audio
+    playing (usually a video-stream/frame-count problem)."""
+    metadata: dict = {}
     try:
         result = subprocess.run(
             [
@@ -252,8 +255,17 @@ def _log_ffprobe_summary(file_path: Path) -> None:
         logger.info("ffprobe %s: %s", file_path.name, summary)
         if result.stderr:
             logger.warning("ffprobe stderr for %s: %s", file_path.name, result.stderr.strip())
+
+        video_stream = next((s for s in streams if s.get('codec_type') == 'video'), None)
+        if video_stream:
+            if video_stream.get('width') and video_stream.get('height'):
+                metadata['width'] = int(video_stream['width'])
+                metadata['height'] = int(video_stream['height'])
+            if video_stream.get('duration'):
+                metadata['duration'] = int(float(video_stream['duration']))
     except Exception as exc:
         logger.warning("ffprobe diagnostic failed for %s: %s", file_path.name, exc)
+    return metadata
 
 
 def download_with_ytdlp(url: str, platform: str) -> tuple[list[Path], str | None]:
@@ -352,7 +364,7 @@ def download_with_ytdlp(url: str, platform: str) -> tuple[list[Path], str | None
         )
         for p in files:
             if p.suffix.lower() in VIDEO_EXTS:
-                _log_ffprobe_summary(p)
+                get_video_metadata(p)
         return files, caption
     except Exception as exc:
         shutil.rmtree(target_dir, ignore_errors=True)
@@ -504,7 +516,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 if p.suffix.lower() in IMAGE_EXTS:
                     await update.message.reply_photo(photo=f, caption=video_caption)
                 else:
-                    await update.message.reply_video(video=f, caption=video_caption, supports_streaming=True)
+                    meta = get_video_metadata(p)
+                    await update.message.reply_video(
+                        video=f,
+                        caption=video_caption,
+                        supports_streaming=True,
+                        width=meta.get('width'),
+                        height=meta.get('height'),
+                        duration=meta.get('duration'),
+                    )
             if extra_text:
                 await update.message.reply_text(extra_text)
         elif sendable:
@@ -521,7 +541,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                         if p.suffix.lower() in IMAGE_EXTS:
                             media.append(InputMediaPhoto(media=f, caption=item_caption))
                         else:
-                            media.append(InputMediaVideo(media=f, caption=item_caption, supports_streaming=True))
+                            meta = get_video_metadata(p)
+                            media.append(InputMediaVideo(
+                                media=f,
+                                caption=item_caption,
+                                supports_streaming=True,
+                                width=meta.get('width'),
+                                height=meta.get('height'),
+                                duration=meta.get('duration'),
+                            ))
                     await update.message.reply_media_group(media=media)
             finally:
                 for f in open_files:
@@ -555,20 +583,49 @@ telegram_app.add_handler(CallbackQueryHandler(on_callback_query))
 telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
 
-def run() -> None:
-    """Start the bot using PTB's built-in webhook server."""
-    port = int(os.environ.get("PORT", 8080))
+async def telegram_webhook(request: 'web.Request') -> 'web.Response':
+    """Receive Telegram updates and hand them to the Application."""
+    try:
+        data = await request.json()
+    except Exception:
+        return web.Response(status=400, text="Invalid JSON")
+    update = Update.de_json(data, telegram_app.bot)
+    await telegram_app.process_update(update)
+    return web.Response(text="OK")
+
+
+async def health(request: 'web.Request') -> 'web.Response':
+    """Trivial 200 OK endpoint for uptime pings (cron-job.org, UptimeRobot,
+    etc.) so the free Render instance doesn't spin down from inactivity."""
+    return web.Response(text="OK")
+
+
+async def on_startup(app: 'web.Application') -> None:
+    await telegram_app.initialize()
     if BASE_URL:
         webhook_url = f"{BASE_URL.rstrip('/')}/webhook"
-        telegram_app.run_webhook(
-            listen="0.0.0.0",
-            port=port,
-            url_path="/webhook",
-            webhook_url=webhook_url,
-        )
-    else:
-        # Fallback: polling (для локальной отладки; на Render как web service не подходит)
-        telegram_app.run_polling()
+        await telegram_app.bot.set_webhook(url=webhook_url)
+        logger.info("Webhook set to %s", webhook_url)
+    await telegram_app.start()
+
+
+async def on_cleanup(app: 'web.Application') -> None:
+    await telegram_app.stop()
+    await telegram_app.shutdown()
+
+
+def run() -> None:
+    """Start our own aiohttp server: it serves /webhook for Telegram updates
+    and / + /health for uptime pings, so the free Render instance can be
+    kept awake externally without hitting 404s."""
+    port = int(os.environ.get("PORT", 8080))
+    web_app = web.Application()
+    web_app.router.add_get('/', health)
+    web_app.router.add_get('/health', health)
+    web_app.router.add_post('/webhook', telegram_webhook)
+    web_app.on_startup.append(on_startup)
+    web_app.on_cleanup.append(on_cleanup)
+    web.run_app(web_app, host='0.0.0.0', port=port)
 
 
 if __name__ == '__main__':
