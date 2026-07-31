@@ -37,6 +37,7 @@ from telegram.ext import (
     filters,
 )
 from telegram.error import TelegramError
+from telegram.request import HTTPXRequest
 
 import yt_dlp
 import requests
@@ -411,7 +412,26 @@ def upload_to_transfersh(file_path: Path) -> str:
 
 
 # Telegram application
-telegram_app = Application.builder().token(TELEGRAM_TOKEN).build()
+# Default httpx timeouts (a few seconds) are too short for uploading video
+# files to Telegram over Render's connection, causing WriteTimeout/TimedOut
+# errors on sendVideo. Give the bot's HTTP client much more room, especially
+# for writing (uploading) request bodies.
+def _make_bot_request() -> HTTPXRequest:
+    return HTTPXRequest(
+        connect_timeout=30.0,
+        read_timeout=60.0,
+        write_timeout=180.0,
+        pool_timeout=30.0,
+    )
+
+
+telegram_app = (
+    Application.builder()
+    .token(TELEGRAM_TOKEN)
+    .request(_make_bot_request())
+    .get_updates_request(_make_bot_request())
+    .build()
+)
 
 
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
