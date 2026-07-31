@@ -286,50 +286,6 @@ def get_video_metadata(file_path: Path) -> dict:
     return metadata
 
 
-def _ensure_h264(file_path: Path) -> Path:
-    """If the video track isn't H.264, transcode it to H.264/AAC so Telegram
-    can reliably play it. Some Instagram renditions are only offered in VP9,
-    which Telegram's client often fails to play (shows a static frame or
-    nothing at all) even though the file itself is perfectly valid."""
-    try:
-        result = subprocess.run(
-            [
-                'ffprobe', '-v', 'error',
-                '-show_entries', 'stream=codec_type,codec_name',
-                '-of', 'json', str(file_path),
-            ],
-            capture_output=True, text=True, timeout=20,
-        )
-        streams = json.loads(result.stdout or '{}').get('streams', [])
-    except Exception as exc:
-        logger.warning("Could not probe %s before H.264 check: %s", file_path.name, exc)
-        return file_path
-
-    video_codec = next((s.get('codec_name') for s in streams if s.get('codec_type') == 'video'), None)
-    has_audio = any(s.get('codec_type') == 'audio' for s in streams)
-
-    if video_codec in ('h264', 'avc1'):
-        return file_path
-
-    logger.info(
-        "Transcoding %s (video=%s, has_audio=%s) to H.264 for Telegram compatibility",
-        file_path.name, video_codec, has_audio,
-    )
-    tmp_path = file_path.with_name(file_path.stem + '_h264.mp4')
-    cmd = ['ffmpeg', '-y', '-i', str(file_path), '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23']
-    cmd += ['-c:a', 'aac'] if has_audio else ['-an']
-    cmd += ['-movflags', '+faststart', str(tmp_path)]
-    try:
-        subprocess.run(cmd, capture_output=True, text=True, timeout=300, check=True)
-        file_path.unlink(missing_ok=True)
-        tmp_path.rename(file_path)
-        logger.info("Transcode OK: %s", file_path.name)
-    except Exception as exc:
-        logger.warning("Transcode to H.264 failed for %s: %s", file_path.name, exc)
-        tmp_path.unlink(missing_ok=True)
-    return file_path
-
-
 def download_with_ytdlp(url: str, platform: str) -> tuple[list[Path], str | None]:
     """Download a post using yt-dlp and return all resulting files along with
     the post/reel caption (if available).
@@ -426,7 +382,6 @@ def download_with_ytdlp(url: str, platform: str) -> tuple[list[Path], str | None
         files = sorted(p for p in target_dir.iterdir() if p.is_file())
         if not files:
             raise RuntimeError("yt-dlp finished without producing any files")
-        files = [_ensure_h264(p) if p.suffix.lower() in VIDEO_EXTS else p for p in files]
         logger.info(
             "Download OK: %d file(s), cookies_used=%s, caption_len=%s, caption_preview=%r",
             len(files),
