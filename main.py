@@ -36,7 +36,7 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
-from telegram.error import TelegramError
+from telegram.error import TelegramError, TimedOut
 from telegram.request import HTTPXRequest
 
 import yt_dlp
@@ -82,6 +82,23 @@ async def is_subscribed(user_id: int, channel: str, application: Application) ->
     except TelegramError as e:
         logger.warning("Failed to check subscription: %s", e)
         return False
+
+
+async def _retry_on_timeout(send_coro_factory, attempts: int = 3, delay: float = 3.0):
+    """Call an async factory (which performs one send attempt, e.g. opening
+    files fresh and calling reply_video) up to `attempts` times, retrying on
+    Telegram TimedOut errors — these have been showing up as transient
+    network blips on Render's free tier rather than permanent failures."""
+    last_exc: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return await send_coro_factory()
+        except TimedOut as exc:
+            last_exc = exc
+            logger.warning("Send timed out (attempt %d/%d): %s", attempt, attempts, exc)
+            if attempt < attempts:
+                await asyncio.sleep(delay)
+    raise last_exc
 
 
 async def send_error_to_admin(context: ContextTypes.DEFAULT_TYPE, message: str) -> None:
@@ -289,13 +306,22 @@ def download_with_ytdlp(url: str, platform: str) -> tuple[list[Path], str | None
         'outtmpl': outtmpl,
         'quiet': True,
         'no_warnings': True,
-        # Prefer an already-muxed single file (video+audio together) if one
-        # is available — Instagram/TikTok/etc. usually offer this directly.
-        # Only fall back to merging separate video+audio streams via ffmpeg
-        # when no combined format exists; that merge step was producing
-        # files with a broken/frozen video track (audio-only playback) in
-        # Telegram for some posts.
-        'format': 'best/bestvideo+bestaudio',
+        # Format priority:
+        #  1) an already-muxed H.264 file with audio (ideal — no merge needed,
+        #     and H.264/AAC is what Telegram's player reliably supports)
+        #  2) any already-muxed format that at least HAS audio (avoids
+        #     picking a video-only 'best', which happened for one post and
+        #     produced a silent, sometimes-unplayable VP9 file)
+        #  3) merge H.264 video specifically with the best audio
+        #  4) merge whatever video+audio streams are available
+        #  5) absolute last resort: bare 'best', even if silent/non-H.264
+        'format': (
+            'best[vcodec^=avc1][acodec!=none]'
+            '/best[acodec!=none]'
+            '/bestvideo[vcodec^=avc1]+bestaudio'
+            '/bestvideo+bestaudio'
+            '/best'
+        ),
         # Ensure the video's metadata (moov atom) is at the start of the
         # file so Telegram (and other players) can start playback and show
         # a proper video preview instead of treating it as a static file.
@@ -363,9 +389,6 @@ def download_with_ytdlp(url: str, platform: str) -> tuple[list[Path], str | None
             len(caption) if caption else 0,
             (caption or '')[:200],
         )
-        for p in files:
-            if p.suffix.lower() in VIDEO_EXTS:
-                get_video_metadata(p)
         return files, caption
     except Exception as exc:
         shutil.rmtree(target_dir, ignore_errors=True)
@@ -532,48 +555,58 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         if len(sendable) == 1 and not oversized:
             # Single file: send as video or photo depending on extension
             p = sendable[0]
-            with open(p, 'rb') as f:
-                if p.suffix.lower() in IMAGE_EXTS:
-                    await update.message.reply_photo(photo=f, caption=video_caption)
-                else:
-                    meta = get_video_metadata(p)
-                    await update.message.reply_video(
-                        video=f,
-                        caption=video_caption,
-                        supports_streaming=True,
-                        width=meta.get('width'),
-                        height=meta.get('height'),
-                        duration=meta.get('duration'),
-                    )
+            if p.suffix.lower() in IMAGE_EXTS:
+                async def _send():
+                    with open(p, 'rb') as f:
+                        return await update.message.reply_photo(photo=f, caption=video_caption)
+                await _retry_on_timeout(_send)
+            else:
+                meta = get_video_metadata(p)
+
+                async def _send():
+                    with open(p, 'rb') as f:
+                        return await update.message.reply_video(
+                            video=f,
+                            caption=video_caption,
+                            supports_streaming=True,
+                            width=meta.get('width'),
+                            height=meta.get('height'),
+                            duration=meta.get('duration'),
+                        )
+                await _retry_on_timeout(_send)
             if extra_text:
                 await update.message.reply_text(extra_text)
         elif sendable:
             # Carousel: send as a media group, Telegram allows max 10 items per group
-            open_files = []
-            try:
-                for chunk_start in range(0, len(sendable), 10):
-                    chunk = sendable[chunk_start:chunk_start + 10]
-                    media = []
-                    for i, p in enumerate(chunk):
-                        f = open(p, 'rb')
-                        open_files.append(f)
-                        item_caption = video_caption if (chunk_start == 0 and i == 0) else None
-                        if p.suffix.lower() in IMAGE_EXTS:
-                            media.append(InputMediaPhoto(media=f, caption=item_caption))
-                        else:
-                            meta = get_video_metadata(p)
-                            media.append(InputMediaVideo(
-                                media=f,
-                                caption=item_caption,
-                                supports_streaming=True,
-                                width=meta.get('width'),
-                                height=meta.get('height'),
-                                duration=meta.get('duration'),
-                            ))
-                    await update.message.reply_media_group(media=media)
-            finally:
-                for f in open_files:
-                    f.close()
+            for chunk_start in range(0, len(sendable), 10):
+                chunk = sendable[chunk_start:chunk_start + 10]
+
+                async def _send(chunk=chunk, chunk_start=chunk_start):
+                    open_files = []
+                    try:
+                        media = []
+                        for i, p in enumerate(chunk):
+                            f = open(p, 'rb')
+                            open_files.append(f)
+                            item_caption = video_caption if (chunk_start == 0 and i == 0) else None
+                            if p.suffix.lower() in IMAGE_EXTS:
+                                media.append(InputMediaPhoto(media=f, caption=item_caption))
+                            else:
+                                meta = get_video_metadata(p)
+                                media.append(InputMediaVideo(
+                                    media=f,
+                                    caption=item_caption,
+                                    supports_streaming=True,
+                                    width=meta.get('width'),
+                                    height=meta.get('height'),
+                                    duration=meta.get('duration'),
+                                ))
+                        return await update.message.reply_media_group(media=media)
+                    finally:
+                        for f in open_files:
+                            f.close()
+
+                await _retry_on_timeout(_send)
             if extra_text:
                 await update.message.reply_text(extra_text)
         else:
@@ -590,6 +623,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 logger.exception("Upload failed: %s", exc)
                 await update.message.reply_text(f"Не удалось загрузить файл {p.name} на внешний сервис.")
                 await send_error_to_admin(context, f"Ошибка загрузки файла {p.name}: {exc}")
+    except TimedOut as exc:
+        logger.exception("Sending to Telegram timed out after retries: %s", exc)
+        await update.message.reply_text(
+            "Файл скачался, но не получилось отправить его из-за таймаута сети. Попробуйте ещё раз."
+        )
+        await send_error_to_admin(context, f"sendVideo/sendPhoto TimedOut для пользователя {user_id}: {exc}")
     finally:
         # Clean up the whole per-request download directory
         if file_paths:
