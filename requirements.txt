@@ -1,4 +1,5 @@
-python-telegram-bot
-yt-dlp
-aiohttp==3.9.3
-requests==2.32.3
+python-telegram-bot[webhooks]==22.3
+yt-dlp>=2026.07.20
+aiohttp>=3.12
+requests>=2.32
+httpx>=0.28
