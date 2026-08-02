@@ -78,9 +78,6 @@ TELEGRAM_CAPTION_LIMIT = 1024
 MAX_CONCURRENT_DOWNLOADS = 1
 _download_semaphore: asyncio.Semaphore | None = None
 
-# Cap resolution for H.264 transcodes to keep ffmpeg's memory footprint low
-# enough to survive on a ~512MB instance.
-MAX_TRANSCODE_HEIGHT = 720
 
 
 # ---------------------------------------------------------------------------
@@ -265,39 +262,6 @@ def get_video_metadata(file_path: Path) -> dict:
     return metadata
 
 
-def ensure_playable_h264(file_path: Path, metadata: dict) -> Path:
-    """If the video isn't H.264 (some Instagram reels are VP9-only, which
-    Telegram's client often fails to play — static frame with only audio),
-    transcode to H.264/AAC at a capped, memory-conservative resolution.
-    Leaves the file untouched if it's already H.264, or if ffmpeg fails."""
-    video_codec = metadata.get('video_codec')
-    if video_codec in ('h264', 'avc1'):
-        return file_path
-
-    has_audio = metadata.get('has_audio', False)
-    logger.info(
-        "Transcoding %s (video=%s, has_audio=%s) to H.264, capped at %dp",
-        file_path.name, video_codec, has_audio, MAX_TRANSCODE_HEIGHT,
-    )
-    tmp_path = file_path.with_name(file_path.stem + '_h264.mp4')
-    cmd = [
-        'ffmpeg', '-y', '-i', str(file_path),
-        '-vf', f"scale=-2:'min({MAX_TRANSCODE_HEIGHT},ih)'",
-        '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '28', '-threads', '1',
-    ]
-    cmd += ['-c:a', 'aac', '-b:a', '96k'] if has_audio else ['-an']
-    cmd += ['-movflags', '+faststart', str(tmp_path)]
-    try:
-        subprocess.run(cmd, capture_output=True, text=True, timeout=180, check=True)
-        file_path.unlink(missing_ok=True)
-        tmp_path.rename(file_path)
-        logger.info("Transcode OK: %s", file_path.name)
-    except Exception as exc:
-        logger.warning("Transcode to H.264 failed/skipped for %s: %s", file_path.name, exc)
-        tmp_path.unlink(missing_ok=True)
-    return file_path
-
-
 # ---------------------------------------------------------------------------
 # Download
 # ---------------------------------------------------------------------------
@@ -316,16 +280,18 @@ def download_with_ytdlp(url: str, platform: str) -> tuple[list[Path], str | None
         'outtmpl': outtmpl,
         'quiet': True,
         'no_warnings': True,
-        # Format priority:
-        #  1) already-muxed H.264 file with audio (ideal, no merge needed)
-        #  2) any already-muxed format that at least has audio
-        #  3) merge H.264 video specifically with the best audio
-        #  4) merge whatever video+audio streams are available
-        #  5) absolute last resort: bare 'best', even if silent/non-H.264
+        # Format priority — force H.264 wherever possible so we never need
+        # to transcode (transcoding is far too slow/heavy for Render's free
+        # tier). Merging bestvideo(H.264)+bestaudio is what reliably worked
+        # before; a bare 'best' is what let VP9-only renditions slip through
+        # for some reels, so it's now the last resort only.
+        #  1) merge H.264 video with real audio (most reliable, no transcode needed)
+        #  2) an already-muxed H.264 file that has audio
+        #  3) merge whatever video+audio streams are available
+        #  4) absolute last resort: bare 'best', even if VP9/silent
         'format': (
-            'best[vcodec^=avc1][acodec!=none]'
-            '/best[acodec!=none]'
-            '/bestvideo[vcodec^=avc1]+bestaudio'
+            'bestvideo[vcodec^=avc1]+bestaudio[acodec!=none]'
+            '/best[vcodec^=avc1][acodec!=none]'
             '/bestvideo+bestaudio'
             '/best'
         ),
@@ -539,8 +505,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 await _retry_on_timeout(_send)
             else:
                 meta = get_video_metadata(p)
-                p = ensure_playable_h264(p, meta)
-                meta = get_video_metadata(p)
 
                 async def _send():
                     with open(p, 'rb') as f:
@@ -569,11 +533,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                                 media.append(InputMediaPhoto(media=f, caption=item_caption))
                             else:
                                 meta = get_video_metadata(p)
-                                p2 = ensure_playable_h264(p, meta)
-                                meta = get_video_metadata(p2)
-                                f.close()
-                                f = open(p2, 'rb')
-                                open_files[-1] = f
                                 media.append(InputMediaVideo(
                                     media=f, caption=item_caption, supports_streaming=True,
                                     width=meta.get('width'), height=meta.get('height'), duration=meta.get('duration'),
