@@ -276,14 +276,65 @@ def get_video_metadata(file_path: Path) -> dict:
 
         video_stream = next((s for s in streams if s.get('codec_type') == 'video'), None)
         if video_stream:
+            metadata['video_codec'] = video_stream.get('codec_name')
             if video_stream.get('width') and video_stream.get('height'):
                 metadata['width'] = int(video_stream['width'])
                 metadata['height'] = int(video_stream['height'])
             if video_stream.get('duration'):
                 metadata['duration'] = int(float(video_stream['duration']))
+        metadata['has_audio'] = any(s.get('codec_type') == 'audio' for s in streams)
     except Exception as exc:
         logger.warning("ffprobe diagnostic failed for %s: %s", file_path.name, exc)
     return metadata
+
+
+# Max concurrent transcodes is implicitly capped by MAX_CONCURRENT_DOWNLOADS
+# (=1), since this only ever runs inside a download job. Keep resolution and
+# encoder settings conservative — Render's free tier has only ~512MB RAM
+# total for the whole process, and a full-resolution/quality transcode
+# previously OOM-killed the entire bot.
+MAX_TRANSCODE_HEIGHT = 720
+
+
+def ensure_playable_h264(file_path: Path, metadata: dict) -> Path:
+    """If the video isn't H.264 (e.g. some Instagram reels are VP9-only,
+    which Telegram's client often fails to play), transcode it to H.264/AAC
+    at a capped, memory-conservative resolution. Falls back to leaving the
+    original file untouched if ffmpeg fails or times out."""
+    video_codec = metadata.get('video_codec')
+    if video_codec in ('h264', 'avc1'):
+        return file_path
+
+    has_audio = metadata.get('has_audio', False)
+    width = metadata.get('width')
+    height = metadata.get('height')
+    logger.info(
+        "Transcoding %s (video=%s, has_audio=%s, size=%sx%s) to H.264, capped at %dp",
+        file_path.name, video_codec, has_audio, width, height, MAX_TRANSCODE_HEIGHT,
+    )
+
+    tmp_path = file_path.with_name(file_path.stem + '_h264.mp4')
+    scale_filter = (
+        f"scale=-2:'min({MAX_TRANSCODE_HEIGHT},ih)'"
+    )
+    cmd = [
+        'ffmpeg', '-y', '-i', str(file_path),
+        '-vf', scale_filter,
+        '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '28',
+        '-threads', '1',
+    ]
+    cmd += ['-c:a', 'aac', '-b:a', '96k'] if has_audio else ['-an']
+    cmd += ['-movflags', '+faststart', str(tmp_path)]
+
+    try:
+        subprocess.run(cmd, capture_output=True, text=True, timeout=180, check=True)
+        file_path.unlink(missing_ok=True)
+        tmp_path.rename(file_path)
+        logger.info("Transcode OK: %s", file_path.name)
+    except Exception as exc:
+        logger.warning("Transcode to H.264 failed/skipped for %s: %s", file_path.name, exc)
+        tmp_path.unlink(missing_ok=True)
+    return file_path
 
 
 def download_with_ytdlp(url: str, platform: str) -> tuple[list[Path], str | None]:
@@ -405,7 +456,7 @@ def download_with_ytdlp(url: str, platform: str) -> tuple[list[Path], str | None
 # very limited CPU/RAM, and running several yt-dlp/ffmpeg jobs at once was
 # likely causing the timeouts under bursts of requests — extra requests now
 # simply queue instead of competing for the same scarce resources.
-MAX_CONCURRENT_DOWNLOADS = 2
+MAX_CONCURRENT_DOWNLOADS = 1
 _download_semaphore: asyncio.Semaphore | None = None
 
 
@@ -562,6 +613,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 await _retry_on_timeout(_send)
             else:
                 meta = get_video_metadata(p)
+                p = ensure_playable_h264(p, meta)
+                meta = get_video_metadata(p)
 
                 async def _send():
                     with open(p, 'rb') as f:
@@ -593,6 +646,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                                 media.append(InputMediaPhoto(media=f, caption=item_caption))
                             else:
                                 meta = get_video_metadata(p)
+                                p = ensure_playable_h264(p, meta)
+                                meta = get_video_metadata(p)
+                                f.close()
+                                f = open(p, 'rb')
+                                open_files[-1] = f
                                 media.append(InputMediaVideo(
                                     media=f,
                                     caption=item_caption,
