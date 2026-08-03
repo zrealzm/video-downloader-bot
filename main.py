@@ -225,7 +225,7 @@ def get_video_metadata(file_path: Path) -> dict:
         result = subprocess.run(
             [
                 'ffprobe', '-v', 'error',
-                '-show_entries', 'stream=codec_type,codec_name,width,height,'
+                '-show_entries', 'stream=codec_type,codec_name,pix_fmt,profile,width,height,'
                                   'avg_frame_rate,nb_frames,duration',
                 '-of', 'json', str(file_path),
             ],
@@ -251,6 +251,8 @@ def get_video_metadata(file_path: Path) -> dict:
         video_stream = next((s for s in streams if s.get('codec_type') == 'video'), None)
         if video_stream:
             metadata['video_codec'] = video_stream.get('codec_name')
+            metadata['pix_fmt'] = video_stream.get('pix_fmt')
+            metadata['profile'] = video_stream.get('profile')
             if video_stream.get('width') and video_stream.get('height'):
                 metadata['width'] = int(video_stream['width'])
                 metadata['height'] = int(video_stream['height'])
@@ -260,6 +262,42 @@ def get_video_metadata(file_path: Path) -> dict:
     except Exception as exc:
         logger.warning("ffprobe diagnostic failed for %s: %s", file_path.name, exc)
     return metadata
+
+
+def convert_for_telegram(src: Path) -> Path:
+    """
+    Перекодирование в максимально совместимый с Telegram формат.
+    """
+    dst = src.with_name(src.stem + "_telegram.mp4")
+
+    subprocess.run(
+        [
+            "ffmpeg",
+            "-y",
+            "-i", str(src),
+
+            "-map", "0:v:0",
+            "-map", "0:a?",
+
+            "-c:v", "libx264",
+            "-preset", "veryfast",
+            "-crf", "20",
+
+            "-pix_fmt", "yuv420p",
+            "-profile:v", "high",
+            "-level", "4.1",
+
+            "-movflags", "+faststart",
+
+            "-c:a", "aac",
+            "-b:a", "128k",
+
+            str(dst),
+        ],
+        check=True,
+    )
+
+    return dst
 
 
 # ---------------------------------------------------------------------------
@@ -280,20 +318,14 @@ def download_with_ytdlp(url: str, platform: str) -> tuple[list[Path], str | None
         'outtmpl': outtmpl,
         'quiet': True,
         'no_warnings': True,
-        # Format priority — force H.264 wherever possible so we never need
-        # to transcode (transcoding is far too slow/heavy for Render's free
-        # tier). Merging bestvideo(H.264)+bestaudio is what reliably worked
-        # before; a bare 'best' is what let VP9-only renditions slip through
-        # for some reels, so it's now the last resort only.
-        #  1) merge H.264 video with real audio (most reliable, no transcode needed)
-        #  2) an already-muxed H.264 file that has audio
-        #  3) merge whatever video+audio streams are available
-        #  4) absolute last resort: bare 'best', even if VP9/silent
+        # Format priority — force H.264 wherever possible. We now also
+        # transcode as a safety net (see convert_for_telegram), so this is
+        # just about avoiding unnecessary transcodes when H.264 is available.
         'format': (
-            'bestvideo[vcodec^=avc1]+bestaudio[acodec!=none]'
-            '/best[vcodec^=avc1][acodec!=none]'
-            '/bestvideo+bestaudio'
-            '/best'
+            'bv*[vcodec*=avc1]+ba'
+            '/b*[vcodec*=avc1]'
+            '/bv+ba'
+            '/b'
         ),
         'postprocessor_args': {'ffmpeg': ['-movflags', '+faststart']},
         'merge_output_format': 'mp4',
@@ -506,6 +538,25 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             else:
                 meta = get_video_metadata(p)
 
+                need_convert = (
+                    meta.get("video_codec") != "h264"
+                    or meta.get("pix_fmt") != "yuv420p"
+                )
+
+                if need_convert:
+                    logger.info(
+                        "Converting for Telegram: codec=%s pix_fmt=%s",
+                        meta.get("video_codec"),
+                        meta.get("pix_fmt"),
+                    )
+                    new_file = await asyncio.get_running_loop().run_in_executor(
+                        None,
+                        convert_for_telegram,
+                        p,
+                    )
+                    p = new_file
+                    meta = get_video_metadata(p)
+
                 async def _send():
                     with open(p, 'rb') as f:
                         return await update.message.reply_video(
@@ -533,6 +584,28 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                                 media.append(InputMediaPhoto(media=f, caption=item_caption))
                             else:
                                 meta = get_video_metadata(p)
+
+                                need_convert = (
+                                    meta.get("video_codec") != "h264"
+                                    or meta.get("pix_fmt") != "yuv420p"
+                                )
+
+                                if need_convert:
+                                    logger.info(
+                                        "Converting for Telegram: codec=%s pix_fmt=%s",
+                                        meta.get("video_codec"),
+                                        meta.get("pix_fmt"),
+                                    )
+                                    new_file = await asyncio.get_running_loop().run_in_executor(
+                                        None,
+                                        convert_for_telegram,
+                                        p,
+                                    )
+                                    p = new_file
+                                    meta = get_video_metadata(p)
+                                    f.close()
+                                    f = open(p, 'rb')
+                                    open_files[-1] = f
                                 media.append(InputMediaVideo(
                                     media=f, caption=item_caption, supports_streaming=True,
                                     width=meta.get('width'), height=meta.get('height'), duration=meta.get('duration'),
