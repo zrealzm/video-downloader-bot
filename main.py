@@ -267,35 +267,48 @@ def get_video_metadata(file_path: Path) -> dict:
 def convert_for_telegram(src: Path) -> Path:
     """
     Перекодирование в максимально совместимый с Telegram формат.
+
+    Render free tier: очень мало CPU/RAM. 'veryfast'+'crf 20' на полном
+    1080p без ограничения потоков уходит в speed=0.05-0.1x (несколько минут
+    на короткий ролик) и приводит к таймауту/рестарту процесса. Поэтому тут:
+    ultrafast, привязка к 1 потоку (без борьбы за scheduler на shared CPU),
+    и понижение разрешения до 720p по высоте.
     """
     dst = src.with_name(src.stem + "_telegram.mp4")
 
-    subprocess.run(
-        [
-            "ffmpeg",
-            "-y",
-            "-i", str(src),
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-i", str(src),
 
-            "-map", "0:v:0",
-            "-map", "0:a?",
+        "-map", "0:v:0",
+        "-map", "0:a?",
 
-            "-c:v", "libx264",
-            "-preset", "veryfast",
-            "-crf", "20",
+        "-vf", "scale=-2:'min(720,ih)'",
 
-            "-pix_fmt", "yuv420p",
-            "-profile:v", "high",
-            "-level", "4.1",
+        "-c:v", "libx264",
+        "-preset", "ultrafast",
+        "-crf", "23",
+        "-threads", "1",
 
-            "-movflags", "+faststart",
+        "-pix_fmt", "yuv420p",
+        "-profile:v", "high",
+        "-level", "4.1",
 
-            "-c:a", "aac",
-            "-b:a", "128k",
+        "-movflags", "+faststart",
 
-            str(dst),
-        ],
-        check=True,
-    )
+        "-c:a", "aac",
+        "-b:a", "96k",
+
+        str(dst),
+    ]
+
+    try:
+        subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=90)
+    except Exception as exc:
+        logger.warning("convert_for_telegram failed/timed out for %s: %s", src.name, exc)
+        dst.unlink(missing_ok=True)
+        return src  # graceful fallback: send the original file as-is
 
     return dst
 
