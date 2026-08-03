@@ -672,7 +672,11 @@ async def telegram_webhook(request: web.Request) -> web.Response:
     except Exception:
         return web.Response(status=400, text="Invalid JSON")
     update = Update.de_json(data, telegram_app.bot)
-    await telegram_app.process_update(update)
+    # Ack Telegram immediately — downloading/transcoding can take way longer
+    # than Telegram's webhook timeout, and processing inline here risked
+    # Telegram re-delivering the same update (looking like duplicate/mixed-up
+    # sends when several links come in quickly).
+    asyncio.create_task(telegram_app.process_update(update))
     return web.Response(text="OK")
 
 
