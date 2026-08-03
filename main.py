@@ -264,15 +264,14 @@ def get_video_metadata(file_path: Path) -> dict:
     return metadata
 
 
-def convert_for_telegram(src: Path) -> Path:
+def convert_for_telegram(src: Path, duration: int | None = None) -> Path:
     """
     Перекодирование в максимально совместимый с Telegram формат.
 
-    Render free tier: очень мало CPU/RAM. 'veryfast'+'crf 20' на полном
-    1080p без ограничения потоков уходит в speed=0.05-0.1x (несколько минут
-    на короткий ролик) и приводит к таймауту/рестарту процесса. Поэтому тут:
-    ultrafast, привязка к 1 потоку (без борьбы за scheduler на shared CPU),
-    и понижение разрешения до 720p по высоте.
+    Render free tier: очень мало CPU/RAM, encode speed часто заметно ниже
+    реального времени. Поэтому: ultrafast, 1 поток, разрешение до 480p, и
+    таймаут, растущий вместе с длительностью исходника (иначе более длинные
+    ролики просто не успевали до фиксированного лимита).
     """
     dst = src.with_name(src.stem + "_telegram.mp4")
 
@@ -284,11 +283,11 @@ def convert_for_telegram(src: Path) -> Path:
         "-map", "0:v:0",
         "-map", "0:a?",
 
-        "-vf", "scale=-2:'min(720,ih)'",
+        "-vf", "scale=-2:'min(480,ih)'",
 
         "-c:v", "libx264",
         "-preset", "ultrafast",
-        "-crf", "23",
+        "-crf", "26",
         "-threads", "1",
 
         "-pix_fmt", "yuv420p",
@@ -303,10 +302,14 @@ def convert_for_telegram(src: Path) -> Path:
         str(dst),
     ]
 
+    # Assume worst case ~1x realtime on Render's shared CPU, with generous
+    # headroom, capped so a single conversion can't hang forever.
+    timeout = min(max(60, (duration or 30) * 6), 240)
+
     try:
-        subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=90)
+        subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=timeout)
     except Exception as exc:
-        logger.warning("convert_for_telegram failed/timed out for %s: %s", src.name, exc)
+        logger.warning("convert_for_telegram failed/timed out for %s (timeout=%ds): %s", src.name, timeout, exc)
         dst.unlink(missing_ok=True)
         return src  # graceful fallback: send the original file as-is
 
@@ -566,6 +569,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                         None,
                         convert_for_telegram,
                         p,
+                        meta.get("duration"),
                     )
                     p = new_file
                     meta = get_video_metadata(p)
@@ -613,6 +617,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                                         None,
                                         convert_for_telegram,
                                         p,
+                                        meta.get("duration"),
                                     )
                                     p = new_file
                                     meta = get_video_metadata(p)
