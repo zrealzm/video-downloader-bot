@@ -67,7 +67,7 @@ DOWNLOAD_DIR = Path(__file__).parent / "downloads"
 DOWNLOAD_DIR.mkdir(exist_ok=True)
 
 IMAGE_EXTS = {'.jpg', '.jpeg', '.png', '.webp'}
-VIDEO_EXTS = {'.mp4', '.mov', '.mkv', '.webm', 'vp9'}
+VIDEO_EXTS = {'.mp4', '.mov', '.mkv', '.webm', '.vp9'}
 
 MAX_TELEGRAM_FILE_SIZE = 50 * 1024 * 1024  # 2000 MB
 TELEGRAM_CAPTION_LIMIT = 1024
