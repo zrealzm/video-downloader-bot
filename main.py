@@ -581,7 +581,23 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                     meta.get("video_codec") != "h264"
                     or meta.get("pix_fmt") != "yuv420p"
                 )
-                if need_convert:
+                source_size_mb = p.stat().st_size / (1024 * 1024)
+                # Если исходник уже сильно больше лимита, "качественный" проход
+                # (без учёта размера) почти наверняка тоже не влезет в 50 МБ —
+                # не тратим время на него, а сразу целимся в размер (заодно
+                # это чинит и кодек, т.к. всегда кодирует в H.264).
+                if need_convert and source_size_mb > 45:
+                    logger.info(
+                        "Source is %.1fMB (over the limit) and needs codec fix — going straight to "
+                        "size-targeted transcode instead of a wasted quality-only pass: %s",
+                        source_size_mb, p.name,
+                    )
+                    p = await asyncio.get_running_loop().run_in_executor(
+                        None, convert_for_telegram, p, meta.get("duration"), 45,
+                    )
+                    meta = get_video_metadata(p)
+                    need_convert = False  # уже сжали под размер, повторно перекодировать не нужно
+                elif need_convert:
                     logger.info(
                         "Converting for Telegram: codec=%s pix_fmt=%s",
                         meta.get("video_codec"), meta.get("pix_fmt"),
