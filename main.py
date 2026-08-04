@@ -69,7 +69,7 @@ DOWNLOAD_DIR.mkdir(exist_ok=True)
 IMAGE_EXTS = {'.jpg', '.jpeg', '.png', '.webp'}
 VIDEO_EXTS = {'.mp4', '.mov', '.mkv', '.webm'}
 
-MAX_TELEGRAM_FILE_SIZE = 1000 * 1024 * 1024  # 50 MB
+MAX_TELEGRAM_FILE_SIZE = 50 * 1024 * 1024  # 1000 MB
 TELEGRAM_CAPTION_LIMIT = 1024
 
 # Render's free tier has very limited CPU/RAM. Only one download (and
