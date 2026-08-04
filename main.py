@@ -37,7 +37,7 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
-from telegram.error import TelegramError, TimedOut, BadRequest
+from telegram.error import TelegramError, TimedOut, BadRequest, NetworkError
 from telegram.request import HTTPXRequest
 
 import yt_dlp
@@ -270,47 +270,61 @@ def get_video_metadata(file_path: Path) -> dict:
     return metadata
 
 
-def convert_for_telegram(src: Path, duration: int | None = None) -> Path:
+def convert_for_telegram(
+    src: Path,
+    duration: int | None = None,
+    target_size_mb: float | None = None,
+) -> Path:
     """
-    Перекодирование в максимально совместимый с Telegram формат.
+    Перекодирование в совместимый с Telegram формат, 720p.
 
-    Render free tier: очень мало CPU/RAM, encode speed часто заметно ниже
-    реального времени. Поэтому: ultrafast, 1 поток, разрешение до 480p, и
-    таймаут, растущий вместе с длительностью исходника (иначе более длинные
-    ролики просто не успевали до фиксированного лимита).
+    Два режима:
+    - target_size_mb не задан: перекодируем ради совместимости кодека
+      (VP9 -> H.264) с постоянным качеством (CRF) — используется, когда
+      Telegram принял бы файл по размеру, но не может нормально его играть.
+    - target_size_mb задан: считаем битрейт видео из желаемого размера файла
+      и длительности ролика и целенаправленно сжимаем под него — используется,
+      когда Telegram реально отклонил файл как слишком большой (>50 МБ).
     """
     dst = src.with_name(src.stem + "_telegram.mp4")
+    duration = duration or 30
 
     cmd = [
-        "ffmpeg",
-        "-y",
-        "-i", str(src),
-
-        "-map", "0:v:0",
-        "-map", "0:a?",
-
-        "-vf", "scale=-2:'min(480,ih)'",
-
+        "ffmpeg", "-y", "-i", str(src),
+        "-map", "0:v:0", "-map", "0:a?",
+        "-vf", "scale=-2:'min(720,ih)'",
         "-c:v", "libx264",
-        "-preset", "ultrafast",
-        "-crf", "26",
+        "-preset", "veryfast",
         "-threads", "1",
-
         "-pix_fmt", "yuv420p",
         "-profile:v", "high",
         "-level", "4.1",
-
         "-movflags", "+faststart",
-
         "-c:a", "aac",
-        "-b:a", "96k",
-
-        str(dst),
     ]
 
-    # Assume worst case ~1x realtime on Render's shared CPU, with generous
-    # headroom, capped so a single conversion can't hang forever.
-    timeout = min(max(60, (duration or 30) * 6), 240)
+    if target_size_mb:
+        audio_kbps = 96
+        # 5% запас, чтобы контейнер/метаданные точно не вылезли за лимит
+        target_bits = target_size_mb * 1024 * 1024 * 8 * 0.95
+        video_kbps = max(150, int(target_bits / duration / 1000) - audio_kbps)
+        cmd += [
+            "-b:v", f"{video_kbps}k",
+            "-maxrate", f"{int(video_kbps * 1.5)}k",
+            "-bufsize", f"{video_kbps * 2}k",
+            "-b:a", f"{audio_kbps}k",
+        ]
+        logger.info(
+            "Target-size transcode for %s: target=%.1fMB duration=%ds -> video_bitrate=%dk",
+            src.name, target_size_mb, duration, video_kbps,
+        )
+    else:
+        cmd += ["-crf", "23", "-b:a", "128k"]
+
+    cmd.append(str(dst))
+
+    # Щедрый запас на случай долгих роликов, но с потолком.
+    timeout = min(max(60, duration * 6), 300)
 
     try:
         subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=timeout)
@@ -538,7 +552,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     def _is_too_large_error(exc: Exception) -> bool:
         msg = str(exc).lower()
-        return isinstance(exc, BadRequest) and (
+        return isinstance(exc, (BadRequest, NetworkError)) and (
             'too large' in msg or 'entity too large' in msg or 'file is too big' in msg
         )
 
@@ -551,7 +565,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                         return await update.message.reply_photo(photo=f, caption=video_caption)
                 try:
                     await _retry_on_timeout(_send)
-                except BadRequest as exc:
+                except (BadRequest, NetworkError) as exc:
                     if _is_too_large_error(exc):
                         size_mb = p.stat().st_size / (1024 * 1024)
                         await update.message.reply_text(
@@ -585,33 +599,29 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                         )
                 try:
                     await _retry_on_timeout(_send)
-                except BadRequest as exc:
+                except (BadRequest, NetworkError) as exc:
                     if not _is_too_large_error(exc):
                         raise
-                    if not need_convert:
-                        # Не перекодировали ради совместимости — попробуем
-                        # перекодировать сейчас, это заодно ощутимо уменьшит
-                        # размер файла (пониженное разрешение/битрейт).
-                        logger.info("File too large for Telegram, trying transcode to shrink it: %s", p.name)
-                        p = await asyncio.get_running_loop().run_in_executor(
-                            None, convert_for_telegram, p, meta.get("duration"),
-                        )
-                        meta = get_video_metadata(p)
+                    # Файл реально отклонён Telegram по размеру — сжимаем
+                    # целенаправленно под ~45 МБ (запас под лимит в 50 МБ),
+                    # независимо от того, конвертировали ли уже ради кодека.
+                    logger.info("File too large for Telegram, compressing to target size: %s", p.name)
+                    p = await asyncio.get_running_loop().run_in_executor(
+                        None, convert_for_telegram, p, meta.get("duration"), 45,
+                    )
+                    meta = get_video_metadata(p)
 
-                        async def _send_retry():
-                            with open(p, 'rb') as f:
-                                return await update.message.reply_video(
-                                    video=f, caption=video_caption, supports_streaming=True,
-                                    width=meta.get('width'), height=meta.get('height'), duration=meta.get('duration'),
-                                )
-                        try:
-                            await _retry_on_timeout(_send_retry)
-                        except BadRequest as exc2:
-                            if not _is_too_large_error(exc2):
-                                raise
-                            need_convert = True  # fall through to the "still too big" message below
-
-                    if need_convert:
+                    async def _send_retry():
+                        with open(p, 'rb') as f:
+                            return await update.message.reply_video(
+                                video=f, caption=video_caption, supports_streaming=True,
+                                width=meta.get('width'), height=meta.get('height'), duration=meta.get('duration'),
+                            )
+                    try:
+                        await _retry_on_timeout(_send_retry)
+                    except (BadRequest, NetworkError) as exc2:
+                        if not _is_too_large_error(exc2):
+                            raise
                         size_mb = p.stat().st_size / (1024 * 1024)
                         await update.message.reply_text(
                             "⚠️ Следующие файлы слишком большие для отправки через Telegram.\n\n"
@@ -661,7 +671,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
                 try:
                     await _retry_on_timeout(_send)
-                except BadRequest as exc:
+                except (BadRequest, NetworkError) as exc:
                     if not _is_too_large_error(exc):
                         raise
                     text = (
