@@ -37,7 +37,7 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
-from telegram.error import TelegramError, TimedOut
+from telegram.error import TelegramError, TimedOut, BadRequest
 from telegram.request import HTTPXRequest
 
 import yt_dlp
@@ -69,7 +69,13 @@ DOWNLOAD_DIR.mkdir(exist_ok=True)
 IMAGE_EXTS = {'.jpg', '.jpeg', '.png', '.webp'}
 VIDEO_EXTS = {'.mp4', '.mov', '.mkv', '.webm'}
 
-MAX_TELEGRAM_FILE_SIZE = 50 * 1024 * 1024  # 50 MB
+# ВНИМАНИЕ: 50 МБ — это жёсткий лимит облачного Bot API (api.telegram.org),
+# он не настраивается на нашей стороне. Поднять его выше можно только через
+# собственный локальный Bot API сервер (self-hosted), которого сейчас нет.
+# Константа поднята, чтобы мы не отсекали файлы заранее и давали Telegram
+# самому решить — но на практике всё, что больше 50 МБ, Telegram всё равно
+# отклонит с ошибкой, которую мы ловим ниже и превращаем в понятное сообщение.
+MAX_TELEGRAM_FILE_SIZE = 2 * 1024 * 1024 * 1024  # 2 GB
 TELEGRAM_CAPTION_LIMIT = 1024
 
 # Render's free tier has very limited CPU/RAM. Only one download (and
@@ -416,16 +422,6 @@ async def download_video(url: str, platform: str) -> tuple[list[Path], str | Non
         return await loop.run_in_executor(None, download_with_ytdlp, url, platform)
 
 
-def upload_to_transfersh(file_path: Path) -> str:
-    """Upload a file to transfer.sh and return the download URL."""
-    file_name = file_path.name
-    with open(file_path, 'rb') as f:
-        response = requests.put(f'https://transfer.sh/{file_name}', data=f, timeout=120)
-    if response.status_code == 200:
-        return response.text.strip()
-    raise RuntimeError(f"Failed to upload file: HTTP {response.status_code}")
-
-
 async def _retry_on_timeout(send_coro_factory, attempts: int = 3, delay: float = 3.0):
     """Retry a send operation on Telegram TimedOut errors — these have shown
     up as transient network blips on Render's free tier."""
@@ -540,38 +536,45 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             video_caption = caption[:TELEGRAM_CAPTION_LIMIT]
             extra_text = caption[TELEGRAM_CAPTION_LIMIT:]
 
-    try:
-        sendable = [p for p in file_paths if p.stat().st_size <= MAX_TELEGRAM_FILE_SIZE]
-        oversized = [p for p in file_paths if p.stat().st_size > MAX_TELEGRAM_FILE_SIZE]
+    def _is_too_large_error(exc: Exception) -> bool:
+        msg = str(exc).lower()
+        return isinstance(exc, BadRequest) and (
+            'too large' in msg or 'entity too large' in msg or 'file is too big' in msg
+        )
 
-        if len(sendable) == 1 and not oversized:
-            p = sendable[0]
+    try:
+        if len(file_paths) == 1:
+            p = file_paths[0]
             if p.suffix.lower() in IMAGE_EXTS:
                 async def _send():
                     with open(p, 'rb') as f:
                         return await update.message.reply_photo(photo=f, caption=video_caption)
-                await _retry_on_timeout(_send)
+                try:
+                    await _retry_on_timeout(_send)
+                except BadRequest as exc:
+                    if _is_too_large_error(exc):
+                        size_mb = p.stat().st_size / (1024 * 1024)
+                        await update.message.reply_text(
+                            "⚠️ Следующие файлы слишком большие для отправки через Telegram.\n\n"
+                            "Максимальный размер файла для ботов — около 50 МБ.\n\n"
+                            f"• {p.name} ({size_mb:.1f} МБ)"
+                        )
+                    else:
+                        raise
             else:
                 meta = get_video_metadata(p)
-
                 need_convert = (
                     meta.get("video_codec") != "h264"
                     or meta.get("pix_fmt") != "yuv420p"
                 )
-
                 if need_convert:
                     logger.info(
                         "Converting for Telegram: codec=%s pix_fmt=%s",
-                        meta.get("video_codec"),
-                        meta.get("pix_fmt"),
+                        meta.get("video_codec"), meta.get("pix_fmt"),
                     )
-                    new_file = await asyncio.get_running_loop().run_in_executor(
-                        None,
-                        convert_for_telegram,
-                        p,
-                        meta.get("duration"),
+                    p = await asyncio.get_running_loop().run_in_executor(
+                        None, convert_for_telegram, p, meta.get("duration"),
                     )
-                    p = new_file
                     meta = get_video_metadata(p)
 
                 async def _send():
@@ -580,14 +583,48 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                             video=f, caption=video_caption, supports_streaming=True,
                             width=meta.get('width'), height=meta.get('height'), duration=meta.get('duration'),
                         )
-                await _retry_on_timeout(_send)
+                try:
+                    await _retry_on_timeout(_send)
+                except BadRequest as exc:
+                    if not _is_too_large_error(exc):
+                        raise
+                    if not need_convert:
+                        # Не перекодировали ради совместимости — попробуем
+                        # перекодировать сейчас, это заодно ощутимо уменьшит
+                        # размер файла (пониженное разрешение/битрейт).
+                        logger.info("File too large for Telegram, trying transcode to shrink it: %s", p.name)
+                        p = await asyncio.get_running_loop().run_in_executor(
+                            None, convert_for_telegram, p, meta.get("duration"),
+                        )
+                        meta = get_video_metadata(p)
+
+                        async def _send_retry():
+                            with open(p, 'rb') as f:
+                                return await update.message.reply_video(
+                                    video=f, caption=video_caption, supports_streaming=True,
+                                    width=meta.get('width'), height=meta.get('height'), duration=meta.get('duration'),
+                                )
+                        try:
+                            await _retry_on_timeout(_send_retry)
+                        except BadRequest as exc2:
+                            if not _is_too_large_error(exc2):
+                                raise
+                            need_convert = True  # fall through to the "still too big" message below
+
+                    if need_convert:
+                        size_mb = p.stat().st_size / (1024 * 1024)
+                        await update.message.reply_text(
+                            "⚠️ Следующие файлы слишком большие для отправки через Telegram.\n\n"
+                            "Максимальный размер файла для ботов — около 50 МБ.\n\n"
+                            f"• {p.name} ({size_mb:.1f} МБ)"
+                        )
             if extra_text:
                 await update.message.reply_text(extra_text)
 
-        elif sendable:
+        elif file_paths:
             # Carousel: send as media group(s), max 10 items per Telegram group
-            for chunk_start in range(0, len(sendable), 10):
-                chunk = sendable[chunk_start:chunk_start + 10]
+            for chunk_start in range(0, len(file_paths), 10):
+                chunk = file_paths[chunk_start:chunk_start + 10]
 
                 async def _send(chunk=chunk, chunk_start=chunk_start):
                     open_files = []
@@ -601,28 +638,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                                 media.append(InputMediaPhoto(media=f, caption=item_caption))
                             else:
                                 meta = get_video_metadata(p)
-
                                 need_convert = (
                                     meta.get("video_codec") != "h264"
                                     or meta.get("pix_fmt") != "yuv420p"
                                 )
-
                                 if need_convert:
-                                    logger.info(
-                                        "Converting for Telegram: codec=%s pix_fmt=%s",
-                                        meta.get("video_codec"),
-                                        meta.get("pix_fmt"),
+                                    new_p = await asyncio.get_running_loop().run_in_executor(
+                                        None, convert_for_telegram, p, meta.get("duration"),
                                     )
-                                    new_file = await asyncio.get_running_loop().run_in_executor(
-                                        None,
-                                        convert_for_telegram,
-                                        p,
-                                        meta.get("duration"),
-                                    )
-                                    p = new_file
-                                    meta = get_video_metadata(p)
+                                    meta = get_video_metadata(new_p)
                                     f.close()
-                                    f = open(p, 'rb')
+                                    f = open(new_p, 'rb')
                                     open_files[-1] = f
                                 media.append(InputMediaVideo(
                                     media=f, caption=item_caption, supports_streaming=True,
@@ -633,22 +659,23 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                         for f in open_files:
                             f.close()
 
-                await _retry_on_timeout(_send)
+                try:
+                    await _retry_on_timeout(_send)
+                except BadRequest as exc:
+                    if not _is_too_large_error(exc):
+                        raise
+                    text = (
+                        "⚠️ Следующие файлы слишком большие для отправки через Telegram.\n\n"
+                        "Максимальный размер файла для ботов — около 50 МБ.\n\n"
+                    )
+                    for p in chunk:
+                        size_mb = p.stat().st_size / (1024 * 1024)
+                        text += f"• {p.name} ({size_mb:.1f} МБ)\n"
+                    await update.message.reply_text(text)
             if extra_text:
                 await update.message.reply_text(extra_text)
         else:
             await update.message.reply_text("Не удалось скачать. Возможно, ссылка неправильная или доступ ограничен.")
-
-        for p in oversized:
-            try:
-                link = upload_to_transfersh(p)
-                await update.message.reply_text(
-                    f"Файл {p.name} слишком большой для отправки в Telegram. Вот ссылка для скачивания: {link}"
-                )
-            except Exception as exc:
-                logger.exception("Upload failed: %s", exc)
-                await update.message.reply_text(f"Не удалось загрузить файл {p.name} на внешний сервис (он слишком большой).")
-                await send_error_to_admin(context, f"Ошибка загрузки файла {p.name}: {exc}")
     except TimedOut as exc:
         logger.exception("Sending to Telegram timed out after retries: %s", exc)
         await update.message.reply_text(
