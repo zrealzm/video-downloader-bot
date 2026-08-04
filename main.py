@@ -294,7 +294,7 @@ def convert_for_telegram(
         "-map", "0:v:0", "-map", "0:a?",
         "-vf", "scale=-2:'min(720,ih)'",
         "-c:v", "libx264",
-        "-preset", "veryfast",
+        "-preset", "ultrafast",
         "-threads", "1",
         "-pix_fmt", "yuv420p",
         "-profile:v", "high",
@@ -324,7 +324,7 @@ def convert_for_telegram(
     cmd.append(str(dst))
 
     # Щедрый запас на случай долгих роликов, но с потолком.
-    timeout = min(max(60, duration * 6), 300)
+    timeout = min(max(60, duration * 6), 400)
 
     try:
         subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=timeout)
